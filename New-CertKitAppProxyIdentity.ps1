@@ -1,6 +1,6 @@
 <#PSScriptInfo
 
-.VERSION 1.2
+.VERSION 1.3
 
 .GUID a9e0f308-5a4c-4ee6-a6f9-452dc867ee72
 
@@ -34,7 +34,7 @@
     - A tenant-wide assignment of the custom role to the CertKit service principal, made directly or through Privileged Identity Management (PIM).
     - A client secret, which is copied to the clipboard and never displayed on screen.
 
-    The script is safe to run more than once. Existing objects with the same names are reused, and existing role and permission assignments are not duplicated. A new client secret is created on every run.
+    The script is safe to run more than once. Existing objects with the same names are reused, and existing role and permission assignments are not duplicated. A new client secret is created on every run. Use -RemoveExistingSecrets to remove older client secrets after the new one is created.
 
 .PARAMETER TenantId
     The tenant ID (GUID) or a verified domain name of the Microsoft Entra tenant to configure. Optional. If omitted, the script uses the tenant of the account you sign in with. Specify this parameter when your account has access to more than one tenant, such as a guest account in a customer tenant, or when the PowerShell session is already connected to Microsoft Graph in another tenant.
@@ -49,7 +49,10 @@
     The lifetime of the client secret in months, from 1 to 24. The default is 12.
 
 .PARAMETER UsePim
-    Assigns the custom role through Privileged Identity Management (PIM) as a permanent active assignment. Requires Microsoft Entra ID P2 or Microsoft Entra ID Governance. Without this switch, the role is assigned directly.
+    Assigns the custom role through Privileged Identity Management (PIM) as a permanent active assignment. Requires Microsoft Entra ID P2 or Microsoft Entra ID Governance. Without this switch, the role is assigned directly. When the custom role is newly created, PIM can take several minutes to recognize it, and the script waits up to 10 minutes.
+
+.PARAMETER RemoveExistingSecrets
+    Removes all other client secrets from the app registration after the new client secret is created. Use this when rotating the secret or replacing a secret that was lost. CertKit can't authenticate with a removed secret, so update CertKit with the new secret right away. Without this switch, existing secrets are kept and the script reports how many remain.
 
 .EXAMPLE
     .\New-CertKitAppProxyIdentity.ps1
@@ -66,6 +69,11 @@
 
     Signs in to the contoso.onmicrosoft.com tenant and creates the CertKit identity there, regardless of the account's home tenant.
 
+.EXAMPLE
+    .\New-CertKitAppProxyIdentity.ps1 -RemoveExistingSecrets
+
+    Creates a new client secret for the existing CertKit identity and removes all older client secrets.
+
 .INPUTS
     None.
 
@@ -76,11 +84,12 @@
     https://directaccess.richardhicks.com/
 
 .NOTES
-    Version:        1.2
+    Version:        1.3
     Creation Date:  November 14, 2026
     Last Updated:   November 14, 2026
     Author:         Richard Hicks
     Organization:   Richard M. Hicks Consulting, Inc.
+    Contact:        rich@richardhicks.com
     Website:        https://www.richardhicks.com/
 
     Requirements:
@@ -102,7 +111,8 @@ Param (
     [string]$RoleName = 'App Proxy Certificate Manager',
     [ValidateRange(1, 24)]
     [int]$SecretExpirationMonths = 12,
-    [switch]$UsePim
+    [switch]$UsePim,
+    [switch]$RemoveExistingSecrets
 
 )
 
@@ -147,8 +157,19 @@ Function Invoke-GraphRequestWithRetry {
 
         Catch {
 
-            If ($Attempt -eq $MaxAttempts) { Throw }
-            Write-Verbose "Request failed (attempt $Attempt of $MaxAttempts). Retrying in $DelaySeconds seconds..."
+            # Retry only errors caused by replication delay, throttling, or service faults. Fail fast on anything else
+            $StatusCode = $null
+
+            If ($_.Exception.Response) { $StatusCode = [int]$_.Exception.Response.StatusCode }
+
+            $ErrorText = "$($_.ErrorDetails.Message) $($_.Exception.Message)"
+            $IsTransient = ($null -eq $StatusCode) -or
+                ($StatusCode -in 404, 408, 429) -or
+                ($StatusCode -ge 500) -or
+                ($StatusCode -eq 400 -and $ErrorText -match 'not ?found|does ?not ?exist|does not reference a valid')
+
+            If (-not $IsTransient -or $Attempt -eq $MaxAttempts) { Throw }
+            Write-Verbose "Request failed with status $StatusCode (attempt $Attempt of $MaxAttempts). Retrying in $DelaySeconds seconds..."
             Start-Sleep -Seconds $DelaySeconds
 
         }
@@ -201,8 +222,21 @@ Try {
 
     Write-Information "Connected to tenant '$TenantName' ($TenantId)." -InformationAction Continue
 
-    # Create or reuse the custom role
-    $Role = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/roleManagement/directory/roleDefinitions?`$filter=displayName eq '$RoleName'" -ErrorAction Stop).value | Select-Object -First 1
+    # Build OData filters with apostrophes doubled and the expression URL-encoded, so any display name is safe
+    $RoleFilter = [uri]::EscapeDataString("displayName eq '$($RoleName -replace "'", "''")'")
+    $AppFilter = [uri]::EscapeDataString("displayName eq '$($DisplayName -replace "'", "''")'")
+
+    # Create or reuse the custom role. Never reuse a built-in role with the same name
+    $RoleCreated = $false
+    $MatchingRoles = @((Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/roleManagement/directory/roleDefinitions?`$filter=$RoleFilter" -ErrorAction Stop).value)
+
+    If ($MatchingRoles | Where-Object { $_.isBuiltIn }) {
+
+        Throw "'$RoleName' is the name of a built-in Entra role. Specify a different name with -RoleName."
+
+    }
+
+    $Role = $MatchingRoles | Select-Object -First 1
 
     If ($Role) {
 
@@ -222,12 +256,13 @@ Try {
         }
 
         $Role = Invoke-MgGraphRequest -Method POST -Uri "$GraphUri/roleManagement/directory/roleDefinitions" -Body $RoleBody -ErrorAction Stop
+        $RoleCreated = $true
         Write-Verbose "Created custom role '$RoleName' ($($Role.id))."
 
     }
 
     # Create or reuse the app registration
-    $App = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/applications?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop).value | Select-Object -First 1
+    $App = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/applications?`$filter=$AppFilter" -ErrorAction Stop).value | Select-Object -First 1
 
     If ($App) {
 
@@ -310,6 +345,7 @@ Try {
     # Assign the custom role tenant-wide, directly or through PIM
     # With -WhatIf, a service principal or role that doesn't exist yet has no assignments to look up
     $ExistingAssignment = $null
+    $RoleAssigned = 'Not assigned'
 
     If ($Sp -and $Role) {
 
@@ -319,6 +355,7 @@ Try {
 
     If ($ExistingAssignment) {
 
+        $RoleAssigned = 'Already assigned'
         Write-Verbose "The '$RoleName' role is already assigned."
 
     }
@@ -349,8 +386,15 @@ Try {
 
             }
 
-            # PIM can take several minutes to recognize a newly created custom role, so allow up to 5 minutes
-            Invoke-GraphRequestWithRetry -Request $PimRequest -MaxAttempts 30 | Out-Null
+            # PIM can take several minutes to recognize a newly created custom role, so allow up to 10 minutes
+            If ($RoleCreated) {
+
+                Write-Information 'Waiting for PIM to recognize the new custom role. This can take several minutes...' -InformationAction Continue
+
+            }
+
+            Invoke-GraphRequestWithRetry -Request $PimRequest -MaxAttempts 60 | Out-Null
+            $RoleAssigned = 'Through PIM'
             Write-Verbose "Assigned the '$RoleName' role through PIM."
 
         }
@@ -375,11 +419,13 @@ Try {
         }
 
         Invoke-GraphRequestWithRetry -Request $AssignmentRequest | Out-Null
+        $RoleAssigned = 'Directly'
         Write-Verbose "Assigned the '$RoleName' role."
 
     }
 
     # Create a client secret and copy it to the clipboard
+    $NewSecretKeyId = $null
     $SecretExpires = (Get-Date).AddMonths($SecretExpirationMonths)
 
     If ($PSCmdlet.ShouldProcess($DisplayName, "Create client secret expiring $($SecretExpires.ToString('d'))")) {
@@ -396,21 +442,55 @@ Try {
         }
 
         $Secret = Invoke-MgGraphRequest -Method POST -Uri "$GraphUri/applications/$($App.id)/addPassword" -Body $SecretBody -ErrorAction Stop
+        $NewSecretKeyId = $Secret.keyId
         $Secret.secretText | Set-Clipboard
         Remove-Variable -Name Secret
         Write-Warning 'The client secret was copied to the clipboard. Paste it into CertKit now, then clear the clipboard with Set-Clipboard -Value $null.'
 
     }
 
+    # Remove older client secrets, or report how many remain
+    $SecretsRemoved = 0
+
+    If ($App.id) {
+
+        $OldSecrets = @((Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/applications/$($App.id)?`$select=passwordCredentials" -ErrorAction Stop).passwordCredentials | Where-Object { $_.keyId -ne $NewSecretKeyId })
+
+        # Remove older secrets only after a new secret was successfully created
+        If ($OldSecrets.Count -gt 0 -and $RemoveExistingSecrets -and $NewSecretKeyId) {
+
+            ForEach ($OldSecret in $OldSecrets) {
+
+                If ($PSCmdlet.ShouldProcess($DisplayName, "Remove client secret '$($OldSecret.displayName)' ($($OldSecret.hint)***), expiring $(([datetime]$OldSecret.endDateTime).ToString('d'))")) {
+
+                    Invoke-MgGraphRequest -Method POST -Uri "$GraphUri/applications/$($App.id)/removePassword" -Body @{ keyId = $OldSecret.keyId } -ErrorAction Stop
+                    $SecretsRemoved++
+                    Write-Verbose "Removed client secret $($OldSecret.keyId)."
+
+                }
+
+            }
+
+        }
+
+        ElseIf ($OldSecrets.Count -gt 0) {
+
+            Write-Warning "The app registration has $($OldSecrets.Count) older client secret(s). Once CertKit is using the new secret, delete them on the app registration's Certificates & secrets page in the Entra admin center. Running this script again with -RemoveExistingSecrets would also remove the secret CertKit is now using."
+
+        }
+
+    }
+
     # Output the values CertKit needs
     [PSCustomObject]@{
 
-        TenantName    = $TenantName
-        TenantId      = $TenantId
-        ClientId      = $App.appId
-        SecretExpires = $SecretExpires
-        CustomRole    = $RoleName
-        RoleAssigned  = If ($UsePim) { 'Through PIM' } Else { 'Directly' }
+        TenantName        = $TenantName
+        TenantId          = $TenantId
+        ClientId          = $App.appId
+        SecretExpires     = $SecretExpires
+        CustomRole        = $RoleName
+        RoleAssigned      = $RoleAssigned
+        OldSecretsRemoved = $SecretsRemoved
 
     }
 

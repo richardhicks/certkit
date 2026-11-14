@@ -55,11 +55,12 @@
     https://directaccess.richardhicks.com/
 
 .NOTES
-    Version:        1.0
+    Version:        1.1
     Creation Date:  November 14, 2026
     Last Updated:   November 14, 2026
     Author:         Richard Hicks
     Organization:   Richard M. Hicks Consulting, Inc.
+    Contact:        rich@richardhicks.com
     Website:        https://www.richardhicks.com/
 
     Requirements:
@@ -69,7 +70,7 @@
 #>
 
 #Requires -Version 5.1
-#Requires -Modules Microsoft.Graph.Authentication
+#Requires -Modules @{ ModuleName = 'Microsoft.Graph.Authentication'; ModuleVersion = '2.0.0' }
 
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 
@@ -197,7 +198,37 @@ Try {
 
                 }
 
-                Invoke-MgGraphRequest @PimRequest | Out-Null
+                # PIM rejects removing an active assignment less than 5 minutes after it starts (ActiveDurationTooShort), so wait and retry
+                $MaxPimAttempts = 12
+
+                For ($PimAttempt = 1; $PimAttempt -le $MaxPimAttempts; $PimAttempt++) {
+
+                    Try {
+
+                        Invoke-MgGraphRequest @PimRequest | Out-Null
+                        Break
+
+                    }
+
+                    Catch {
+
+                        $ErrorText = "$($_.ErrorDetails.Message) $($_.Exception.Message)"
+
+                        If ($ErrorText -notmatch 'ActiveDurationTooShort' -or $PimAttempt -eq $MaxPimAttempts) { Throw }
+
+                        If ($PimAttempt -eq 1) {
+
+                            Write-Information 'The PIM assignment was made less than 5 minutes ago and cannot be removed yet. Waiting up to 6 minutes...' -InformationAction Continue
+
+                        }
+
+                        Write-Verbose "PIM assignment is too new to remove (attempt $PimAttempt of $MaxPimAttempts). Retrying in 30 seconds..."
+                        Start-Sleep -Seconds 30
+
+                    }
+
+                }
+
                 $Result.RoleAssignmentsRemoved++
                 Write-Verbose "Removed the '$RoleName' role assignment through PIM."
 
