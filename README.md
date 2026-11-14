@@ -1,143 +1,144 @@
-# New-CertKitAppProxyIdentity
+# Update-EntraAppProxyCertificate
 
-[![License](https://img.shields.io/github/license/richardhicks/certkit?label=License)](https://github.com/richardhicks/certkit/blob/main/LICENSE)
+[![PowerShell Gallery](https://img.shields.io/badge/PowerShell%20Gallery-Update--EntraAppProxyCertificate-blue)](https://www.powershellgallery.com/packages/Update-EntraAppProxyCertificate) [![License](https://img.shields.io/badge/License-MIT-green)](https://github.com/richardhicks/entraappproxy/blob/main/LICENSE) [![Version](https://img.shields.io/badge/Version-1.6.2-brightgreen)](https://github.com/richardhicks/entraappproxy)
 
-PowerShell script that creates a least-privilege Microsoft Entra identity for CertKit to deploy TLS certificates to Microsoft Entra Application Proxy applications.
-
-## Features
-
-- **Least privilege** - CertKit receives a custom Entra role that can only read Application Proxy settings and update the Application Proxy SSL certificate, plus the read-only Microsoft Graph application permission `Application.Read.All`. It does not need Application Administrator, Cloud Application Administrator, or any write permission to app registrations.
-- **Safe to run more than once** - Existing objects with the same names are reused, and existing role and permission assignments are not duplicated. Each run creates a new client secret, so the script can also be used to issue a replacement secret.
-- **Direct or PIM role assignment** - The custom role is assigned tenant-wide, either directly or, with `-UsePim`, through Privileged Identity Management (PIM) as a permanent active assignment.
-- **Secret handling** - The client secret is copied to the clipboard and is never displayed on screen or written to the transcript.
-- **Replication-aware** - Requests that can fail while new objects replicate across Entra ID are retried automatically, up to six times at ten-second intervals.
-- **Preview with -WhatIf** - `-WhatIf` connects to Microsoft Graph and reports the objects that would be created without making any changes.
-- **Transcript logging** - Every run, including `-WhatIf` runs, is recorded in a transcript in `$env:ProgramData\RMHCI\PowerShell`.
+PowerShell script for updating the TLS certificate assigned to Microsoft Entra application proxy applications published on a custom domain.
 
 ## Description
 
-CertKit can deploy renewed TLS certificates to Microsoft Entra Application Proxy applications using client secret authentication. To do that, it needs an identity in the tenant that can find App Proxy applications and update their certificates. Creating that identity by hand, with a custom role and the correct permissions, involves several steps in the Entra admin center.
+Microsoft Entra application proxy applications published using a custom domain require a TLS certificate to be uploaded to the service. Update-EntraAppProxyCertificate.ps1 replaces that certificate using the Microsoft Graph API, either for a single application by name or for every application in the tenant whose external URL matches a name in the supplied certificate.
 
-`New-CertKitAppProxyIdentity.ps1` creates everything CertKit needs in one run:
+The script validates the certificate before making any changes. It confirms that the PFX file includes the private key, that the certificate is currently valid, and that its subject or a subject alternative name matches the host name in the application's external URL. After each update, it reads the certificate back from the service and compares the thumbprint to confirm the change.
 
-1. A custom Entra role, `App Proxy Certificate Manager` by default.
-2. A single-tenant app registration, `CertKit App Proxy Deployment` by default, and its service principal.
-3. The Microsoft Graph application permission `Application.Read.All`, granted with admin consent, which CertKit uses to find App Proxy applications.
-4. A tenant-wide assignment of the custom role to the service principal, made directly or through PIM.
-5. A client secret named `CertKit`, copied to the clipboard.
+When the `-UpdateAll` switch is used, wildcard certificates, multi-SAN certificates, or a combination of both are supported. The following applications are skipped automatically:
 
-When it finishes, the script returns the tenant ID and client ID to enter in CertKit, along with the secret expiration date.
+- Applications published using the default `msappproxy.net` domain.
+- Applications published using Global Secure Access (Microsoft Entra Private Access).
+- Applications whose external URL does not match a name in the certificate.
 
-### Custom Role Permissions
-
-The custom role grants only the following permissions:
-
-| Permission | Purpose |
-|---|---|
-| `microsoft.directory/applications/applicationProxy/read` | Read Application Proxy settings of applications |
-| `microsoft.directory/applications/applicationProxySslCertificate/update` | Update the Application Proxy SSL certificate of applications |
-| `microsoft.directory/connectorGroups/allProperties/read` | Read the properties of Application Proxy connector groups |
+Applications are discovered using the Microsoft Entra on-premises application template. Applications created programmatically without this template are not discovered and must be updated individually using the `-Name` parameter.
 
 ## Installation
 
-Download `New-CertKitAppProxyIdentity.ps1` from [https://github.com/richardhicks/certkit](https://github.com/richardhicks/certkit). If the file was downloaded from the internet, unblock it before running it:
+### PowerShell Gallery
 
-```powershell
-Unblock-File -Path .\New-CertKitAppProxyIdentity.ps1
+```
+Install-Script -Name Update-EntraAppProxyCertificate -Scope CurrentUser
 ```
 
-The script requires the `Microsoft.Graph.Authentication` module, version 2.0.0 or later. No other Microsoft Graph modules are needed.
+The required Microsoft.Graph.Authentication module is installed automatically if it is not already present.
 
-```powershell
+### Manual Installation
+
+1. Install the Microsoft Graph Authentication module, if it is not already installed:
+
+```
 Install-Module -Name Microsoft.Graph.Authentication -Scope CurrentUser
 ```
 
-## Usage
+2. Download `Update-EntraAppProxyCertificate.ps1` from the [GitHub repository](https://github.com/richardhicks/entraappproxy).
+3. If the file was downloaded from the internet, unblock it:
 
-When the script runs, it signs in to Microsoft Graph interactively and requests the delegated scopes `Application.ReadWrite.All`, `AppRoleAssignment.ReadWrite.All`, and `RoleManagement.ReadWrite.Directory`. It then displays the name and ID of the connected tenant, so it's clear where the objects will be created.
-
-### Parameters
-
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `-TenantId` | String | No | The tenant ID (GUID) or a verified domain name of the tenant to configure. Specify this when your account has access to more than one tenant, such as a guest account in a customer tenant, or when the session is already connected to Microsoft Graph in another tenant. Default: the tenant of the account you sign in with |
-| `-DisplayName` | String | No | The display name of the CertKit app registration. Default: `CertKit App Proxy Deployment` |
-| `-RoleName` | String | No | The display name of the custom Entra role. Default: `App Proxy Certificate Manager` |
-| `-SecretExpirationMonths` | Int | No | The lifetime of the client secret in months (1 to 24). Default: `12` |
-| `-UsePim` | Switch | No | Assign the custom role through PIM as a permanent active assignment. Requires Microsoft Entra ID P2 or Microsoft Entra ID Governance. Default: the role is assigned directly |
-
-The script also supports `-WhatIf`, `-Confirm`, and `-Verbose`. Use `-Verbose` to see which objects were created and which existing objects were reused.
-
-### Output
-
-The script returns one object with the following properties:
-
-| Property | Description |
-|---|---|
-| `TenantName` | The display name of the tenant |
-| `TenantId` | The tenant ID |
-| `ClientId` | The application (client) ID of the CertKit app registration |
-| `SecretExpires` | The expiration date of the client secret |
-| `CustomRole` | The display name of the custom Entra role |
-| `RoleAssigned` | `Directly` or `Through PIM` |
-
-Enter the `TenantId`, the `ClientId`, and the client secret from the clipboard in CertKit.
-
-> **Important:** Paste the client secret into CertKit immediately, then clear the clipboard with `Set-Clipboard -Value $null`. The secret cannot be retrieved again. If it is lost, run the script again to create a new one.
-
-### Examples
-
-```powershell
-# Create the CertKit identity with the default names and a 12-month client secret, and assign the custom role directly
-.\New-CertKitAppProxyIdentity.ps1
-
-# Create the CertKit identity with a 6-month client secret, and assign the custom role through PIM
-.\New-CertKitAppProxyIdentity.ps1 -UsePim -SecretExpirationMonths 6
-
-# Sign in to a specific tenant and create the CertKit identity there, regardless of the account's home tenant
-.\New-CertKitAppProxyIdentity.ps1 -TenantId contoso.onmicrosoft.com
-
-# Report the objects that would be created without making any changes
-.\New-CertKitAppProxyIdentity.ps1 -WhatIf
-
-# Show which objects were created and which were reused
-.\New-CertKitAppProxyIdentity.ps1 -Verbose
+```
+Unblock-File -Path .\Update-EntraAppProxyCertificate.ps1
 ```
 
-### Renewing the Client Secret
+## Parameters
 
-Run the script again with the same `-DisplayName` and `-RoleName` before the current secret expires. The existing app registration, role, and assignments are reused, and a new client secret is created and copied to the clipboard. Update the secret in CertKit, then delete the old secret from the app registration's **Certificates & secrets** page in the Entra admin center. The script does not remove existing secrets.
+| Parameter             | Description                                                                                                                                    |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-Name`               | The display name of the application proxy application. Required when updating a single application.                                             |
+| `-UpdateAll`          | Updates all application proxy applications in the tenant whose external URL matches a name in the supplied certificate.                         |
+| `-PfxFile`            | The path to the PFX file containing the new TLS certificate and its private key.                                                                |
+| `-Password`           | The password protecting the PFX file, supplied as a secure string.                                                                              |
+| `-TenantId`           | The Microsoft Entra tenant ID or domain name. Optional. Required only when the signed in account has access to more than one tenant.            |
+| `-SkipNameValidation` | Suppresses validation of the certificate names against the application's external URL. Valid only when updating a single application by name. |
+
+The script also supports the common `-WhatIf` and `-Confirm` parameters.
+
+## Usage
+
+Update the TLS certificate for a single application:
+
+```
+$Password = Read-Host -Prompt 'Enter PFX password' -AsSecureString
+.\Update-EntraAppProxyCertificate.ps1 -Name 'hrwebapp' -PfxFile 'C:\Certs\hrwebapp.pfx' -Password $Password
+```
+
+Update a single application in a specific tenant:
+
+```
+.\Update-EntraAppProxyCertificate.ps1 -Name 'hrwebapp' -PfxFile 'C:\Certs\hrwebapp.pfx' -Password $Password -TenantId 'contoso.com'
+```
+
+Update all applications whose external URL matches a name in the certificate:
+
+```
+.\Update-EntraAppProxyCertificate.ps1 -UpdateAll -PfxFile 'C:\Certs\wildcard.pfx' -Password $Password
+```
+
+List the applications that would be updated without making any changes:
+
+```
+.\Update-EntraAppProxyCertificate.ps1 -UpdateAll -PfxFile 'C:\Certs\wildcard.pfx' -Password $Password -WhatIf
+```
+
+## Output
+
+The script emits one object to the pipeline for each application processed, with the following properties:
+
+| Property     | Description                                                                                                       |
+| ------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `Name`       | The display name of the application.                                                                              |
+| `Status`     | `Updated`, `Unconfirmed`, `Skipped`, or `Failed`.                                                                 |
+| `Thumbprint` | The thumbprint of the certificate reported by the service after the update. Null for skipped and failed applications. |
+| `Expires`    | The expiration date of the certificate reported by the service after the update. Null for skipped and failed applications. |
+| `Reason`     | The reason the application was skipped, failed, or could not be confirmed. Null for successful updates.           |
+
+No objects are emitted when `-WhatIf` is specified or when the script terminates with an error before processing begins.
+
+### Exit Codes
+
+The script sets an exit code for callers that cannot consume pipeline output, such as Task Scheduler or CI/CD pipelines.
+
+| Exit Code | Description                                                         |
+| --------- | ------------------------------------------------------------------- |
+| `0`       | All updates completed and were confirmed.                           |
+| `1`       | The script terminated with an error before processing completed. Returned when the script is run with `powershell.exe` or `pwsh`. When the script is called from within PowerShell, a terminating error is thrown instead. |
+| `2`       | One or more updates failed.                                         |
+| `3`       | One or more updates completed but could not be confirmed.           |
 
 ### Logging
 
-Each run is recorded in a transcript in `$env:ProgramData\RMHCI\PowerShell`, named `New-CertKitAppProxyIdentity_<yyyyMMdd-HHmmss>.log`. The folder is created if it doesn't exist. The client secret is never written to the transcript.
-
-## Notes
-
-- Existing objects are found by display name. If more than one app registration or custom role has the same name, the first one returned is used. Use unique names with `-DisplayName` and `-RoleName` to avoid this.
-- The existing role assignment check looks for active assignments only. When `-UsePim` is used, the PIM assignment is permanent and active, so it is detected on later runs.
-- The role is assigned at the tenant scope (`/`), so CertKit can update the certificate of any Application Proxy application in the tenant.
+Each run is recorded in a transcript written to `$env:ProgramData\RMHCI\PowerShell` with a date and time stamped file name.
 
 ## Requirements
 
-- Windows PowerShell 5.1 or PowerShell 7.
-- The `Microsoft.Graph.Authentication` PowerShell module, version 2.0.0 or later.
-- Microsoft Entra ID P1 or higher, which is required for Application Proxy and custom roles.
-- Microsoft Entra ID P2 or Microsoft Entra ID Governance when `-UsePim` is used.
-- An account with at least the Privileged Role Administrator role in the target tenant.
+- Windows PowerShell 5.1 or PowerShell 7 and later.
+- Microsoft.Graph.Authentication module version 2.0.0 or later.
+- The Cloud Application Administrator role (or higher) in Microsoft Entra ID.
+- The `Application.ReadWrite.All` and `Directory.ReadWrite.All` delegated Microsoft Graph permissions.
+- A PFX file containing the TLS certificate and its private key.
+
+> **Note:** Application proxy configuration is exposed only in the Microsoft Graph beta endpoint.
+
+## Additional Information
+
+- [onPremisesPublishing resource type (Microsoft Graph beta)](https://learn.microsoft.com/en-us/graph/api/resources/onpremisespublishing?view=graph-rest-beta)
+- [Configure custom domains with Microsoft Entra application proxy](https://learn.microsoft.com/en-us/entra/identity/app-proxy/how-to-configure-custom-domain)
 
 ## Author
 
-**Richard M. Hicks** - [Richard M. Hicks Consulting, Inc.](https://www.richardhicks.com/)
+**Richard Hicks** - [Richard M. Hicks Consulting, Inc.](https://www.richardhicks.com/)
 
-- Website: [https://www.richardhicks.com/](https://www.richardhicks.com/)
-- GitHub: [https://github.com/richardhicks/certkit](https://github.com/richardhicks/certkit)
+- Website: <https://www.richardhicks.com/>
+- GitHub: <https://github.com/richardhicks/entraappproxy>
 - X: [@richardhicks](https://x.com/richardhicks)
 
 ## License
 
-This project is licensed under the [MIT License](https://github.com/richardhicks/certkit/blob/main/LICENSE).
+This project is licensed under the [MIT License](https://github.com/richardhicks/entraappproxy/blob/main/LICENSE).
 
 ## Copyright
 
-&copy; 2026 Richard M. Hicks Consulting, Inc.
+© 2026 Richard M. Hicks Consulting, Inc.
