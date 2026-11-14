@@ -1,3 +1,25 @@
+<#PSScriptInfo
+
+.VERSION 1.2
+
+.GUID a9e0f308-5a4c-4ee6-a6f9-452dc867ee72
+
+.AUTHOR Richard Hicks
+
+.COMPANYNAME Richard M. Hicks Consulting, Inc.
+
+.COPYRIGHT Copyright (C) 2026 Richard M. Hicks Consulting, Inc. All Rights Reserved.
+
+.LICENSE Licensed under the MIT License. See LICENSE file in the project root for full license information.
+
+.LICENSEURI https://github.com/richardhicks/certkit/blob/main/LICENSE
+
+.PROJECTURI https://github.com/richardhicks/certkit
+
+.TAGS CertKit, Entra, EntraID, AppProxy, ApplicationProxy, Certificate, TLS, SSL, MicrosoftGraph, Graph, ServicePrincipal, PIM, LeastPrivilege
+
+#>
+
 <#
 
 .SYNOPSIS
@@ -54,7 +76,7 @@
     https://directaccess.richardhicks.com/
 
 .NOTES
-    Version:        1.1
+    Version:        1.2
     Creation Date:  November 14, 2026
     Last Updated:   November 14, 2026
     Author:         Richard Hicks
@@ -69,7 +91,7 @@
 #>
 
 #Requires -Version 5.1
-#Requires -Modules Microsoft.Graph.Authentication
+#Requires -Modules @{ ModuleName = 'Microsoft.Graph.Authentication'; ModuleVersion = '2.0.0' }
 
 [CmdletBinding(SupportsShouldProcess)]
 
@@ -84,9 +106,22 @@ Param (
 
 )
 
-# Start transcript
-$TranscriptPath = Join-Path -Path $env:ProgramData -ChildPath "New-CertKitAppProxyIdentity_$(Get-Date -Format 'yyyyMMddHHmmss').log"
-Start-Transcript -Path $TranscriptPath | Out-Null
+#Region Logging
+
+# Start transcript, including -WhatIf runs
+$LogPath = Join-Path -Path $env:ProgramData -ChildPath 'RMHCI\PowerShell'
+$LogFile = Join-Path -Path $LogPath -ChildPath "New-CertKitAppProxyIdentity_$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+
+If (-not (Test-Path -Path $LogPath)) {
+
+    New-Item -Path $LogPath -ItemType Directory -Force -WhatIf:$false -Confirm:$false | Out-Null
+
+}
+
+Start-Transcript -Path $LogFile -WhatIf:$false -Confirm:$false | Out-Null
+$ExitCode = 0
+
+#EndRegion
 
 # Retry Graph requests that can fail while new objects replicate across Entra ID
 Function Invoke-GraphRequestWithRetry {
@@ -241,7 +276,15 @@ Try {
     # Grant the read-only Microsoft Graph application permission Application.Read.All
     $GraphSp = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/servicePrincipals?`$filter=appId eq '00000003-0000-0000-c000-000000000000'&`$select=id,appRoles" -ErrorAction Stop).value[0]
     $AppRoleId = ($GraphSp.appRoles | Where-Object { $_.value -eq 'Application.Read.All' -and $_.allowedMemberTypes -contains 'Application' }).id
-    $ExistingGrant = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/servicePrincipals/$($Sp.id)/appRoleAssignments" -ErrorAction Stop).value | Where-Object { $_.appRoleId -eq $AppRoleId }
+
+    # With -WhatIf, a service principal that doesn't exist yet has no grants to look up
+    $ExistingGrant = $null
+
+    If ($Sp) {
+
+        $ExistingGrant = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/servicePrincipals/$($Sp.id)/appRoleAssignments" -ErrorAction Stop).value | Where-Object { $_.appRoleId -eq $AppRoleId }
+
+    }
 
     If ($ExistingGrant) {
 
@@ -265,7 +308,14 @@ Try {
     }
 
     # Assign the custom role tenant-wide, directly or through PIM
-    $ExistingAssignment = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/roleManagement/directory/roleAssignments?`$filter=principalId eq '$($Sp.id)' and roleDefinitionId eq '$($Role.id)'" -ErrorAction Stop).value
+    # With -WhatIf, a service principal or role that doesn't exist yet has no assignments to look up
+    $ExistingAssignment = $null
+
+    If ($Sp -and $Role) {
+
+        $ExistingAssignment = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/roleManagement/directory/roleAssignments?`$filter=principalId eq '$($Sp.id)' and roleDefinitionId eq '$($Role.id)'" -ErrorAction Stop).value
+
+    }
 
     If ($ExistingAssignment) {
 
@@ -299,7 +349,8 @@ Try {
 
             }
 
-            Invoke-GraphRequestWithRetry -Request $PimRequest | Out-Null
+            # PIM can take several minutes to recognize a newly created custom role, so allow up to 5 minutes
+            Invoke-GraphRequestWithRetry -Request $PimRequest -MaxAttempts 30 | Out-Null
             Write-Verbose "Assigned the '$RoleName' role through PIM."
 
         }
@@ -367,13 +418,21 @@ Try {
 
 Catch {
 
-    Write-Error $_
-    Throw
+    # Record the error in the transcript before logging stops
+    $ErrorActionPreference = 'Continue'
+    Write-Error -ErrorRecord $_
+    $ExitCode = 1
 
 }
 
 Finally {
 
     Stop-Transcript | Out-Null
+
+}
+
+If ($ExitCode -ne 0) {
+
+    Exit $ExitCode
 
 }

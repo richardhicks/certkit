@@ -82,9 +82,22 @@ Param (
 
 )
 
-# Start transcript
-$TranscriptPath = Join-Path -Path $env:ProgramData -ChildPath "Remove-CertKitAppProxyIdentity_$(Get-Date -Format 'yyyyMMddHHmmss').log"
-Start-Transcript -Path $TranscriptPath | Out-Null
+#Region Logging
+
+# Start transcript, including -WhatIf runs
+$LogPath = Join-Path -Path $env:ProgramData -ChildPath 'RMHCI\PowerShell'
+$LogFile = Join-Path -Path $LogPath -ChildPath "Remove-CertKitAppProxyIdentity_$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+
+If (-not (Test-Path -Path $LogPath)) {
+
+    New-Item -Path $LogPath -ItemType Directory -Force -WhatIf:$false -Confirm:$false | Out-Null
+
+}
+
+Start-Transcript -Path $LogFile -WhatIf:$false -Confirm:$false | Out-Null
+$ExitCode = 0
+
+#EndRegion
 
 Try {
 
@@ -281,13 +294,21 @@ Try {
 
 Catch {
 
-    Write-Error $_
-    Throw
+    # Record the error in the transcript before logging stops
+    $ErrorActionPreference = 'Continue'
+    Write-Error -ErrorRecord $_
+    $ExitCode = 1
 
 }
 
 Finally {
 
     Stop-Transcript | Out-Null
+
+}
+
+If ($ExitCode -ne 0) {
+
+    Exit $ExitCode
 
 }
