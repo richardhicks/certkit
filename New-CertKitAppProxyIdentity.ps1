@@ -14,6 +14,9 @@
 
     The script is safe to run more than once. Existing objects with the same names are reused, and existing role and permission assignments are not duplicated. A new client secret is created on every run.
 
+.PARAMETER TenantId
+    The tenant ID (GUID) or a verified domain name of the Microsoft Entra tenant to configure. Optional. If omitted, the script uses the tenant of the account you sign in with. Specify this parameter when your account has access to more than one tenant, such as a guest account in a customer tenant, or when the PowerShell session is already connected to Microsoft Graph in another tenant.
+
 .PARAMETER DisplayName
     The display name of the CertKit app registration. The default is 'CertKit App Proxy Deployment'.
 
@@ -36,6 +39,11 @@
 
     Creates the CertKit identity with a 6-month client secret, and assigns the custom role through PIM.
 
+.EXAMPLE
+    .\New-CertKitAppProxyIdentity.ps1 -TenantId contoso.onmicrosoft.com
+
+    Signs in to the contoso.onmicrosoft.com tenant and creates the CertKit identity there, regardless of the account's home tenant.
+
 .INPUTS
     None.
 
@@ -46,7 +54,7 @@
     https://directaccess.richardhicks.com/
 
 .NOTES
-    Version:        1.0
+    Version:        1.1
     Creation Date:  November 14, 2026
     Last Updated:   November 14, 2026
     Author:         Richard Hicks
@@ -67,6 +75,7 @@
 
 Param (
 
+    [string]$TenantId,
     [string]$DisplayName = 'CertKit App Proxy Deployment',
     [string]$RoleName = 'App Proxy Certificate Manager',
     [ValidateRange(1, 24)]
@@ -136,8 +145,26 @@ Try {
 
     }
 
+    # Sign in to a specific tenant when one is specified
+    If ($TenantId) { $ConnectParams['TenantId'] = $TenantId }
+
     Connect-MgGraph @ConnectParams
     $TenantId = (Get-MgContext).TenantId
+
+    # Display the connected tenant so it's clear where objects will be created
+    Try {
+
+        $TenantName = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/organization?`$select=displayName" -ErrorAction Stop).value[0].displayName
+
+    }
+
+    Catch {
+
+        $TenantName = 'Unknown'
+
+    }
+
+    Write-Information "Connected to tenant '$TenantName' ($TenantId)." -InformationAction Continue
 
     # Create or reuse the custom role
     $Role = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/roleManagement/directory/roleDefinitions?`$filter=displayName eq '$RoleName'" -ErrorAction Stop).value | Select-Object -First 1
@@ -327,6 +354,7 @@ Try {
     # Output the values CertKit needs
     [PSCustomObject]@{
 
+        TenantName    = $TenantName
         TenantId      = $TenantId
         ClientId      = $App.appId
         SecretExpires = $SecretExpires
