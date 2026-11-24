@@ -79,11 +79,12 @@
     https://directaccess.richardhicks.com/
 
 .NOTES
-    Version:        1.1
+    Version:        1.2
     Creation Date:  November 14, 2026
     Last Updated:   November 23, 2026
     Author:         Richard Hicks
     Organization:   Richard M. Hicks Consulting, Inc.
+    Contact:        rich@richardhicks.com
     Website:        https://www.richardhicks.com/
 
     Requirements:
@@ -177,8 +178,13 @@ Try {
 
     Write-Information "Connected to tenant '$TenantName' ($TenantId)." -InformationAction Continue
 
-    # Find the custom role
-    $Role = @((Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/roleManagement/directory/roleDefinitions?`$filter=displayName eq '$RoleName'" -ErrorAction Stop).value)
+    # Build OData filters with apostrophes doubled and the expression URL-encoded, so any display name is safe
+    $RoleFilter = [uri]::EscapeDataString("displayName eq '$($RoleName -replace "'", "''")'")
+    $AppFilter = [uri]::EscapeDataString("displayName eq '$($DisplayName -replace "'", "''")'")
+
+    # Find the custom role. Never touch a built-in role with the same name
+    $Role = @((Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/roleManagement/directory/roleDefinitions?`$filter=$RoleFilter" -ErrorAction Stop).value)
+    If ($Role | Where-Object { $_.isBuiltIn }) { Throw "'$RoleName' is the name of a built-in Entra role. Specify the custom role with -RoleName. No changes were made." }
     If ($Role.Count -gt 1) { Throw "Found $($Role.Count) custom roles named '$RoleName'. Resolve the duplicates manually. No changes were made." }
     $Role = $Role | Select-Object -First 1
 
@@ -220,7 +226,7 @@ Try {
     Else {
 
         # Find the app registration and its service principal
-        $App = @((Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/applications?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop).value)
+        $App = @((Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/applications?`$filter=$AppFilter" -ErrorAction Stop).value)
         If ($App.Count -gt 1) { Throw "Found $($App.Count) app registrations named '$DisplayName'. Resolve the duplicates manually. No changes were made." }
         $App = $App | Select-Object -First 1
 
@@ -268,32 +274,63 @@ Try {
 
                 }
 
-                Invoke-MgGraphRequest @PimRequest | Out-Null
+                # PIM rejects removing an active assignment less than 5 minutes after it starts (ActiveDurationTooShort), so wait and retry
+                $MaxPimAttempts = 12
+
+                For ($PimAttempt = 1; $PimAttempt -le $MaxPimAttempts; $PimAttempt++) {
+
+                    Try {
+
+                        Invoke-MgGraphRequest @PimRequest | Out-Null
+                        Break
+
+                    }
+
+                    Catch {
+
+                        $ErrorText = "$($_.ErrorDetails.Message) $($_.Exception.Message)"
+
+                        If ($ErrorText -notmatch 'ActiveDurationTooShort' -or $PimAttempt -eq $MaxPimAttempts) { Throw }
+
+                        If ($PimAttempt -eq 1) {
+
+                            Write-Information 'The PIM assignment was made less than 5 minutes ago and cannot be removed yet. Waiting up to 6 minutes...' -InformationAction Continue
+
+                        }
+
+                        Write-Verbose "PIM assignment is too new to remove (attempt $PimAttempt of $MaxPimAttempts). Retrying in 30 seconds..."
+                        Start-Sleep -Seconds 30
+
+                    }
+
+                }
+
                 $Result.RoleAssignmentsRemoved++
                 Write-Verbose "Removed the '$RoleName' role assignment through PIM."
 
             }
 
-        }
+            # Remove only assignments of the custom role. A managed identity isn't deleted and can hold other Entra roles
+            $Assignments = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/roleManagement/directory/roleAssignments?`$filter=principalId eq '$($Sp.id)' and roleDefinitionId eq '$($Role.id)'" -ErrorAction Stop).value
 
-        $Assignments = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/roleManagement/directory/roleAssignments?`$filter=principalId eq '$($Sp.id)'" -ErrorAction Stop).value
+            ForEach ($Assignment in $Assignments) {
 
-        ForEach ($Assignment in $Assignments) {
+                If ($PSCmdlet.ShouldProcess($DisplayName, "Remove '$RoleName' role assignment $($Assignment.id)")) {
 
-            If ($PSCmdlet.ShouldProcess($DisplayName, "Remove role assignment $($Assignment.id)")) {
+                    # An assignment just removed through PIM can still be listed briefly, so a failure here is not fatal
+                    Try {
 
-                # An assignment just removed through PIM can still be listed briefly, so a failure here is not fatal
-                Try {
+                        Invoke-MgGraphRequest -Method DELETE -Uri "$GraphUri/roleManagement/directory/roleAssignments/$($Assignment.id)" -ErrorAction Stop
+                        $Result.RoleAssignmentsRemoved++
+                        Write-Verbose "Removed role assignment $($Assignment.id)."
 
-                    Invoke-MgGraphRequest -Method DELETE -Uri "$GraphUri/roleManagement/directory/roleAssignments/$($Assignment.id)" -ErrorAction Stop
-                    $Result.RoleAssignmentsRemoved++
-                    Write-Verbose "Removed role assignment $($Assignment.id)."
+                    }
 
-                }
+                    Catch {
 
-                Catch {
+                        Write-Verbose "Could not remove role assignment $($Assignment.id). It may already be removed through PIM."
 
-                    Write-Verbose "Could not remove role assignment $($Assignment.id). It may already be removed through PIM."
+                    }
 
                 }
 
@@ -426,7 +463,16 @@ Catch {
 
 Finally {
 
-    Stop-Transcript -WhatIf:$false -Confirm:$false | Out-Null
+    # Stop-Transcript supports -WhatIf in PowerShell 7 but not in Windows PowerShell 5.1
+    $StopTranscriptParams = @{}
+
+    If ((Get-Command -Name Stop-Transcript).Parameters.ContainsKey('WhatIf')) {
+
+        $StopTranscriptParams = @{ WhatIf = $false; Confirm = $false }
+
+    }
+
+    Stop-Transcript @StopTranscriptParams | Out-Null
 
 }
 

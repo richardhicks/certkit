@@ -103,6 +103,7 @@
     Last Updated:   November 23, 2026
     Author:         Richard Hicks
     Organization:   Richard M. Hicks Consulting, Inc.
+    Contact:        rich@richardhicks.com
     Website:        https://www.richardhicks.com/
 
     Requirements:
@@ -177,8 +178,19 @@ Function Invoke-GraphRequestWithRetry {
 
         Catch {
 
-            If ($Attempt -eq $MaxAttempts) { Throw }
-            Write-Verbose "Request failed (attempt $Attempt of $MaxAttempts). Retrying in $DelaySeconds seconds..."
+            # Retry only errors caused by replication delay, throttling, or service faults. Fail fast on anything else
+            $StatusCode = $null
+
+            If ($_.Exception.Response) { $StatusCode = [int]$_.Exception.Response.StatusCode }
+
+            $ErrorText = "$($_.ErrorDetails.Message) $($_.Exception.Message)"
+            $IsTransient = ($null -eq $StatusCode) -or
+                ($StatusCode -in 404, 408, 429) -or
+                ($StatusCode -ge 500) -or
+                ($StatusCode -eq 400 -and $ErrorText -match 'not ?found|does ?not ?exist|does not reference a valid')
+
+            If (-not $IsTransient -or $Attempt -eq $MaxAttempts) { Throw }
+            Write-Verbose "Request failed with status $StatusCode (attempt $Attempt of $MaxAttempts). Retrying in $DelaySeconds seconds..."
             Start-Sleep -Seconds $DelaySeconds
 
         }
@@ -246,6 +258,21 @@ Try {
 
     Write-Information "Connected to tenant '$TenantName' ($TenantId)." -InformationAction Continue
 
+    # Build OData filters with apostrophes doubled and the expression URL-encoded, so any display name is safe
+    $RoleFilter = [uri]::EscapeDataString("displayName eq '$($RoleName -replace "'", "''")'")
+    $AppFilter = [uri]::EscapeDataString("displayName eq '$($DisplayName -replace "'", "''")'")
+
+    # Find the custom role before making any changes. Never reuse a built-in role with the same name
+    $MatchingRoles = @((Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/roleManagement/directory/roleDefinitions?`$filter=$RoleFilter" -ErrorAction Stop).value)
+
+    If ($MatchingRoles | Where-Object { $_.isBuiltIn }) {
+
+        Throw "'$RoleName' is the name of a built-in Entra role. Specify a different name with -RoleName."
+
+    }
+
+    $Role = $MatchingRoles | Select-Object -First 1
+
     If ($UseManagedIdentity) {
 
         # Find the managed identity by object ID, then by client ID
@@ -274,7 +301,7 @@ Try {
     Else {
 
         # Create or reuse the app registration
-        $App = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/applications?`$filter=displayName eq '$DisplayName'" -ErrorAction Stop).value | Select-Object -First 1
+        $App = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/applications?`$filter=$AppFilter" -ErrorAction Stop).value | Select-Object -First 1
 
         If ($App) {
 
@@ -324,7 +351,6 @@ Try {
 
     # Create or reuse the custom role
     $RoleCreated = $false
-    $Role = (Invoke-MgGraphRequest -Method GET -Uri "$GraphUri/roleManagement/directory/roleDefinitions?`$filter=displayName eq '$RoleName'" -ErrorAction Stop).value | Select-Object -First 1
 
     If ($Role) {
 
@@ -386,6 +412,7 @@ Try {
     # Assign the custom role tenant-wide, directly or through PIM
     # With -WhatIf, a service principal or role that doesn't exist yet has no assignments to look up
     $ExistingAssignment = $null
+    $RoleAssigned = 'Not assigned'
 
     If ($Sp -and $Role) {
 
@@ -395,6 +422,7 @@ Try {
 
     If ($ExistingAssignment) {
 
+        $RoleAssigned = 'Already assigned'
         Write-Verbose "The '$RoleName' role is already assigned."
 
     }
@@ -433,6 +461,7 @@ Try {
             }
 
             Invoke-GraphRequestWithRetry -Request $PimRequest -MaxAttempts 60 | Out-Null
+            $RoleAssigned = 'Through PIM'
             Write-Verbose "Assigned the '$RoleName' role through PIM."
 
         }
@@ -457,6 +486,7 @@ Try {
         }
 
         Invoke-GraphRequestWithRetry -Request $AssignmentRequest | Out-Null
+        $RoleAssigned = 'Directly'
         Write-Verbose "Assigned the '$RoleName' role."
 
     }
@@ -517,7 +547,7 @@ Try {
 
             ElseIf ($OldSecrets.Count -gt 0) {
 
-                Write-Warning "The app registration has $($OldSecrets.Count) older client secret(s). Once CertKit is using the new secret, remove them by running this script again with -RemoveExistingSecrets, or delete them in the Entra admin center."
+                Write-Warning "The app registration has $($OldSecrets.Count) older client secret(s). Once CertKit is using the new secret, delete them on the app registration's Certificates & secrets page in the Entra admin center. Running this script again with -RemoveExistingSecrets would also remove the secret CertKit is now using."
 
             }
 
@@ -535,7 +565,7 @@ Try {
             ManagedIdentity = $DisplayName
             ClientId        = $Sp.appId
             CustomRole      = $RoleName
-            RoleAssigned    = If ($UsePim) { 'Through PIM' } Else { 'Directly' }
+            RoleAssigned    = $RoleAssigned
 
         }
 
@@ -550,7 +580,7 @@ Try {
             ClientId          = $App.appId
             SecretExpires     = $SecretExpires
             CustomRole        = $RoleName
-            RoleAssigned      = If ($UsePim) { 'Through PIM' } Else { 'Directly' }
+            RoleAssigned      = $RoleAssigned
             OldSecretsRemoved = $SecretsRemoved
 
         }
@@ -570,7 +600,16 @@ Catch {
 
 Finally {
 
-    Stop-Transcript -WhatIf:$false -Confirm:$false | Out-Null
+    # Stop-Transcript supports -WhatIf in PowerShell 7 but not in Windows PowerShell 5.1
+    $StopTranscriptParams = @{}
+
+    If ((Get-Command -Name Stop-Transcript).Parameters.ContainsKey('WhatIf')) {
+
+        $StopTranscriptParams = @{ WhatIf = $false; Confirm = $false }
+
+    }
+
+    Stop-Transcript @StopTranscriptParams | Out-Null
 
 }
 
